@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- 运行时生成 ---
+logs/
+gui_state.json
+*.log
+
+# 用户配置: 首次运行自动生成, 不随仓库分发
+config.toml
+
+# --- WorkBuddy 工作区数据 ---
+.workbuddy/
+
+# --- IDE / 系统 ---
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

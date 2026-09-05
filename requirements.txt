@@ -1,0 +1,35 @@
+# ============================================================
+#  TUI Image Compressor — Python dependencies
+#  Install:  pip install -r requirements.txt
+# ============================================================
+
+# --- Core (required) -------------------------------------------------------
+
+textual>=0.47.0          # TUI framework (App, widgets, CSS, workers)
+Pillow>=10.0.0           # Image decode / resize / JPEG encode
+pillow-heif>=0.15.0      # HEIC / AVIF decoder plugin for Pillow
+numpy>=1.24.0             # Array bridge for GPU resize path
+PySide6>=6.6.0            # GUI framework (图形界面, TUI 可不用)
+
+# --- Optional: NVIDIA GPU acceleration ------------------------------------
+# If you have an NVIDIA GPU and want GPU-accelerated resize in the
+# compression loop, install PyTorch with CUDA support:
+#
+#   pip install torch  (CPU + CUDA wheels from PyPI)
+#   or visit https://pytorch.org/get-started/locally/ for a specific
+#   CUDA build, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Without torch the tool still works — it falls back to CPU resize
+# via Pillow LANCZOS.
+
+# --- Optional: Animated image → MP4 (H.265) conversion --------------------
+# Requires FFmpeg installed as a system binary:
+#
+#   Windows: winget install FFmpeg
+#   macOS:   brew install ffmpeg
+#   Linux:   sudo apt install ffmpeg
+#
+# Without FFmpeg, animated GIFs / WebP are skipped (not converted).
+# With FFmpeg, they are converted to MP4 H.265 using the best available
+# encoder: hevc_nvenc (NVIDIA) → hevc_qsv (Intel) → libx265 (CPU).

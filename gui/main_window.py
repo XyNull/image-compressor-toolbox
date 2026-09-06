@@ -303,7 +303,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(wrap)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
-        lab = QLabel("视频合并 (源视频 → 目标文件 · 悬停节点查看详情)")
+        lab = QLabel("视频合并 (单击目标视频展开来源链路 · 悬停查看详情)")
         lab.setObjectName("sectionLabel")
         v.addWidget(lab)
 
@@ -536,14 +536,16 @@ class MainWindow(QMainWindow):
                     status="组数超限" if over_groups
                     else "单组超限" if over_count else "待合并"))
                 links.append((src_rows, tgt_row))
-        # 保留旧状态 (已合并/跳过)
+        # 保留旧状态 (已合并/时长异常/跳过)
         old = {(t.directory, t.name): t for t in self.tgt_model.items}
         for t in targets:
             prev = old.get((t.directory, t.name))
-            if prev and prev.status == "已合并":
-                t.status = "已合并"
+            if prev and prev.status in ("已合并", "时长异常"):
+                t.status = prev.status
                 t.output_size = prev.output_size
                 t.output_path = prev.output_path
+                t.duration_expected = prev.duration_expected
+                t.duration_actual = prev.duration_actual
         self.tgt_model.reset_items(targets)
         self.src_model.refresh_all()
         self._video_links = links
@@ -712,14 +714,30 @@ class MainWindow(QMainWindow):
     def _on_merge_dir_done(self, report) -> None:
         outputs = {p: p.stat().st_size for p in report.outputs
                    if p.exists()}
+        # 时长异常: (输出路径, 期望时长, 实际时长); info 含全部正常输出
+        issues = {p: (e, a) for p, e, a in
+                  getattr(report, "duration_issues", [])}
+        info = {p: (e, a) for p, e, a in
+                getattr(report, "duration_info", [])}
         for i, t in enumerate(self.tgt_model.items):
             if t.directory != report.directory:
                 continue
             out_path = t.directory / t.name
             if out_path in outputs:
-                t.status = "已合并"
+                t.status = ("时长异常" if out_path in issues
+                            else "已合并")
                 t.output_size = outputs[out_path]
                 t.output_path = out_path
+                if out_path in issues:
+                    t.duration_expected, t.duration_actual = \
+                        issues[out_path]
+                    self._log(
+                        f"⚠ {t.name} ({t.directory.name}) 时长异常: "
+                        f"实际 {t.duration_actual:.1f}s / 期望 "
+                        f"{t.duration_expected:.1f}s — 请检查该文件",
+                        "warn")
+                elif out_path in info:
+                    t.duration_expected, t.duration_actual = info[out_path]
                 if out_path.parent not in self._batch_dirs:
                     self._batch_dirs.append(out_path.parent)
             elif t.status == "合并中":

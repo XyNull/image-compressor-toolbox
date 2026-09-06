@@ -188,6 +188,8 @@ class TargetItem:
     output_size: int = 0      # 合并后实际大小
     output_path: Optional[Path] = None
     status: str = "待合并"
+    duration_expected: float = 0.0   # 源视频时长之和 (秒)
+    duration_actual: float = 0.0     # 成片实际时长 (秒)
 
 
 class VideoSourceModel(QAbstractTableModel):
@@ -324,7 +326,8 @@ class VideoTargetModel(QAbstractTableModel):
                 return QColor(C_OK)
             if c == 6:
                 color = {"待合并": None, "合并中": C_RUN, "已合并": C_OK,
-                         "跳过": C_WARN, "失败": C_ERR}.get(it.status)
+                         "跳过": C_WARN, "失败": C_ERR,
+                         "时长异常": C_ERR}.get(it.status)
                 return QColor(color) if color else None
         if role == Qt.ToolTipRole:
             return str(it.directory / it.name)

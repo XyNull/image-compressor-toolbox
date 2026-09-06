@@ -382,7 +382,34 @@ class SettingsDialog(QDialog):
                        tip="否则跳过该组")
         self._add_unit_spin(form, "video_merge", "timeout", "合并超时",
                             {"秒": 1, "分钟": 60}, "分钟", 1, 1440)
+        form.addRow(self._hr(w))
+        self._add_bool(form, "video_merge", "concat_genpts",
+                       "genpts 补全时间戳",
+                       tip="concat 输入加 -fflags +genpts")
+        self._add_bool(form, "video_merge", "normalize_pts",
+                       "转码前重排视频时间戳",
+                       tip="setpts=N/fps/TB, 修复时长虚增+冻结帧"
+                           "(个别 VFR 源可能轻微变速, 可关闭)")
+        self._add_bool(form, "video_merge", "duration_check",
+                       "合并后校验时长",
+                       tip="成片时长 vs 源视频时长之和, 偏差过大标红色感叹号")
+        self._add_spin(form, "video_merge", "duration_tolerance_pct",
+                       "时长偏差容忍", 0.1, 50.0, suffix="%",
+                       tip="相对百分比; 与下方绝对秒数取较大者")
+        self._add_spin(form, "video_merge", "duration_tolerance_min_s",
+                       "时长偏差容忍下限", 0.1, 60.0, suffix="秒",
+                       tip="短视频用固定秒数兜底")
+        self._add_bool(form, "video_merge", "duration_repair",
+                       "时长异常时自动修复",
+                       tip="从 concat 列表重转码(setpts 重排); 仍异常才标红")
         return self._scroll(w)
+
+    @staticmethod
+    def _hr(parent: QWidget) -> QFrame:
+        line = QFrame(parent)
+        line.setFrameShape(QFrame.HLine)
+        line.setObjectName("toolSep")
+        return line
 
     def _page_misc(self) -> QWidget:
         w = QWidget()

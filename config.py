@@ -71,6 +71,12 @@ DEFAULTS: dict[str, Any] = {
         "output_extension": "mp4",
         "overwrite_existing": False,   # 目标文件已存在时是否覆盖 (False=跳过)
         "timeout": 3600,               # 单次合并+转码超时 (秒)
+        "concat_genpts": True,         # concat 输入加 -fflags +genpts (补全缺失 PTS)
+        "normalize_pts": True,         # 转码前 setpts 重排视频时间戳 (修复时长虚增/冻结帧)
+        "duration_check": True,        # 合并后校验成片时长 vs 源视频时长之和
+        "duration_tolerance_pct": 3.0, # 时长偏差容忍 (相对百分比)
+        "duration_tolerance_min_s": 1.0,  # 时长偏差容忍下限 (秒)
+        "duration_repair": True,       # 时长异常时尝试从 concat 列表重转码修复
     },
     "ui": {
         "max_name_len": 22,
@@ -137,6 +143,15 @@ output_prefix = "V"          # 输出文件名前缀 → V1.mp4, V2.mp4
 output_extension = "mp4"
 overwrite_existing = false   # 目标文件已存在时: true=覆盖, false=跳过该组
 timeout = 3600               # 单次合并+转码超时（秒）
+concat_genpts = true         # concat 输入加 -fflags +genpts (补全缺失 PTS)
+normalize_pts = true         # 转码前 setpts=N/fps/TB 重排视频时间戳:
+                             # concat 产物/QSV 编码器对 PTS 空洞会放大为
+                             # 时长虚增+中段冻结帧, 重排后时长=帧数/fps
+duration_check = true        # 合并后校验成片时长 vs 源视频时长之和
+duration_tolerance_pct = 3.0 # 时长偏差容忍 (相对百分比, 超过则报时长异常)
+duration_tolerance_min_s = 1.0  # 时长偏差容忍下限 (秒)
+duration_repair = true       # 时长异常时尝试从 concat 列表重转码修复,
+                             # 仍异常则在流图目标节点标红色感叹号提醒
 
 [ui]
 max_name_len = 22            # 状态栏文件名截断长度
@@ -214,6 +229,12 @@ class VideoMergeConfig:
     output_extension: str = "mp4"
     overwrite_existing: bool = False
     timeout: int = 3600
+    concat_genpts: bool = True
+    normalize_pts: bool = True
+    duration_check: bool = True
+    duration_tolerance_pct: float = 3.0
+    duration_tolerance_min_s: float = 1.0
+    duration_repair: bool = True
 
 
 @dataclass

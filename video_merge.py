@@ -2,16 +2,26 @@
 
 流程（每目录独立处理）:
   1. 扫描目录顶层视频文件（不递归、跳过 compressed/ 等子目录）。
-  2. ffprobe 探测每个视频的分辨率 / 帧率 / 视频编码。
+  2. ffprobe 探测每个视频的分辨率 / 帧率 / 视频编码 / 容器时长。
   3. 按分辨率分组（容差 tolerance_px: 1918x1080 ≈ 1920x1080）。
   4. 限制检查:
      - 组内视频数 > max_videos_per_group (10) → 该组跳过并提示;
      - 分辨率组数(目标文件数) > max_output_files (4) → 整个目录跳过并提示。
   5. 复制流合并: ffmpeg -f concat -safe 0 -c copy（组内编码不一致 → 提示跳过）。
+     concat 输入加 -fflags +genpts (concat_genpts) 补全缺失 PTS。
   6. AV1 转码: 首选 av1_qsv (HW:QSV)，回退 libsvtav1 / libaom-av1。
      设置: 质量 quality(26)、关键帧 keyframe_interval(2s)、音频 AAC LC 128kbps
      声道同原版、无字幕、不改变分辨率。
-  7. 输出 V1.mp4 / V2.mp4 ...（按分辨率从大到小编号）。
+     ⚠ 时长虚增/冻结帧对策 (normalize_pts, 默认开): 转码前用
+     -vf setpts=N/fps/TB 重排视频时间戳 — concat 产物/QSV 编码器对不干净
+     时间戳 (PTS 空洞/非单调) 会放大为成片时长虚增+中段无法播放, 重排后
+     成片时长 = 帧数/fps, 与播放器逐帧解码结果一致 (格式工厂正常而
+     ShanaEncoder 异常正是这条路径差异)。
+  7. 时长校验 (duration_check): 成片视频流时长 vs 源视频流时长之和, 偏差超过
+     max(duration_tolerance_min_s, duration_tolerance_pct%) → 尝试从 concat
+     列表直接重转码修复 (duration_repair, setpts 重排), 仍异常则上报
+     MergeReport.duration_issues (GUI 流图目标节点显示红色感叹号)。
+  8. 输出 V1.mp4 / V2.mp4 ...（按分辨率从大到小编号）。
 
 说明: 本功能针对真实视频文件, 无需考虑由多帧动图转成的视频(动画转换产物
 在 compressed/ 子目录, 不在合并范围内)。
@@ -56,6 +66,7 @@ class VideoProbe:
     height: int = 0
     fps: float = 0.0
     vcodec: str = ""
+    duration: float = 0.0     # 容器时长 (秒), 解析失败为 0
     ok: bool = False
     error: str = ""
 
@@ -66,6 +77,7 @@ class MergeGroup:
     width: int = 0
     height: int = 0
     videos: List[Path] = field(default_factory=list)
+    duration_sum: float = 0.0   # 组内源视频时长之和 (秒), 时长校验期望值
 
 
 @dataclass
@@ -78,6 +90,36 @@ class MergeReport:
     skipped: int = 0         # 跳过的组数
     outputs: List[Path] = field(default_factory=list)
     messages: List[str] = field(default_factory=list)  # 提示/原因
+    # 时长异常: (输出文件, 期望时长s, 实际时长s) — 输出保留, 由 UI 标红提醒
+    duration_issues: List[Tuple[Path, float, float]] = field(
+        default_factory=list)
+    # 时长校验数据: (输出文件, 期望s, 实际s) — 含全部正常输出 (tooltip 展示)
+    duration_info: List[Tuple[Path, float, float]] = field(
+        default_factory=list)
+
+
+def fmt_duration(sec: float) -> str:
+    """秒 → 'M:SS.s' / 'H:MM:SS.s' 展示文本; 非正数返回 '—'。"""
+    if sec <= 0:
+        return "—"
+    s = float(sec)
+    h = int(s // 3600)
+    s -= h * 3600
+    m = int(s // 60)
+    s -= m * 60
+    if h:
+        return f"{h}:{m:02d}:{s:04.1f}"
+    return f"{m}:{s:04.1f}"
+
+
+def _parse_duration(raw) -> float:
+    """ffprobe 时长字段解析: 'N/A'/None/异常 → 0。"""
+    if raw is None:
+        return 0.0
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class VideoMerger:
@@ -156,7 +198,7 @@ class VideoMerger:
     # ------------------------------------------------------------------ #
 
     def probe(self, path: Path) -> VideoProbe:
-        """ffprobe 探测单个视频: 分辨率 / 帧率 / 视频编码。"""
+        """ffprobe 探测单个视频: 分辨率 / 帧率 / 视频编码 / 视频流时长。"""
         probe = VideoProbe(path=path)
         if not self.ffprobe:
             probe.error = "ffprobe 不可用"
@@ -167,7 +209,8 @@ class VideoMerger:
                     self.ffprobe, "-v", "error",
                     "-select_streams", "v:0",
                     "-show_entries",
-                    "stream=width,height,r_frame_rate,codec_name",
+                    "stream=width,height,r_frame_rate,codec_name,duration:"
+                    "format=duration",
                     "-of", "json",
                     str(path),
                 ],
@@ -183,12 +226,51 @@ class VideoMerger:
             probe.height = int(stream.get("height") or 0)
             probe.vcodec = str(stream.get("codec_name") or "")
             probe.fps = self._parse_fps(str(stream.get("r_frame_rate") or ""))
+            # 视频流时长优先 (虚增/冻结发生在视频流上; 音频更长时不被拉高),
+            # 流时长缺失 (如 TS) 回退容器时长
+            probe.duration = _parse_duration(stream.get("duration"))
+            if probe.duration <= 0:
+                probe.duration = _parse_duration(
+                    data.get("format", {}).get("duration"))
             probe.ok = probe.width > 0 and probe.height > 0
             if not probe.ok:
                 probe.error = "未探测到视频流/分辨率"
         except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError) as exc:
             probe.error = f"{type(exc).__name__}: {exc}"
         return probe
+
+    def probe_duration(self, path: Path) -> float:
+        """ffprobe 读取视频流时长 (秒, 容器时长兜底); 失败返回 0。"""
+        if not self.ffprobe:
+            return 0.0
+        try:
+            result = subprocess.run(
+                [
+                    self.ffprobe, "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True, text=True, timeout=30,
+                **HIDDEN_KW,
+            )
+            dur = _parse_duration(result.stdout.strip())
+            if dur > 0:
+                return dur
+            result = subprocess.run(
+                [
+                    self.ffprobe, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True, text=True, timeout=30,
+                **HIDDEN_KW,
+            )
+            return _parse_duration(result.stdout.strip())
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return 0.0
 
     @staticmethod
     def _parse_fps(r_frame_rate: str) -> float:
@@ -311,8 +393,11 @@ class VideoMerger:
         groups = self._group_videos(probes)
         report.groups = len(groups)
         say(f"  按分辨率分组: [cyan]{len(groups)}[/] 组")
+        probe_by_path = {p.path: p for p in probes}
         for g in groups:
-            say(f"    {g.width}x{g.height}: {len(g.videos)} 个")
+            g.duration_sum = sum(probe_by_path[v].duration for v in g.videos)
+            say(f"    {g.width}x{g.height}: {len(g.videos)} 个"
+                f" · 共 {fmt_duration(g.duration_sum)}")
 
         # 限制 1: 目标文件数（分辨率组数）上限
         if len(groups) > vm.max_output_files:
@@ -364,8 +449,7 @@ class VideoMerger:
                 continue
 
             ok = self._merge_and_transcode(
-                g, out_path, encoder, vm, report, say,
-            )
+                g, out_path, encoder, vm, report, say, probe_by_path)
             if ok:
                 report.merged += 1
                 report.outputs.append(out_path)
@@ -390,17 +474,19 @@ class VideoMerger:
         vm,
         report: MergeReport,
         say: Callable[[str], None],
+        probe_by_path: Optional[dict] = None,
     ) -> bool:
-        """复制流合并 + AV1 转码。成功返回 True。"""
+        """复制流合并 + AV1 转码 + 时长校验。成功返回 True。"""
         assert self.ffmpeg is not None
+        probe_by_path = probe_by_path or {}
         tmpdir = Path(tempfile.mkdtemp(prefix="vmerge_"))
         merged_tmp = tmpdir / "merged.mp4"
         try:
-            # --- 检查组内视频编码一致性（concat copy 需要一致）---
+            # --- 检查组内视频编码一致性（concat demuxer 需要一致）---
             vcodes: set[str] = set()
             for v in group.videos:
-                p = self.probe(v)
-                if p.ok and p.vcodec:
+                p = probe_by_path.get(v)
+                if p is not None and p.vcodec:
                     vcodes.add(p.vcodec)
             if len(vcodes) > 1:
                 say(f"[yellow]⚠ 组 {group.width}x{group.height} 视频编码不一致 "
@@ -410,7 +496,14 @@ class VideoMerger:
                 )
                 return False
 
+            # 组内帧率 (关键帧间隔换算 / setpts 修复用)
+            fps = next((probe_by_path[v].fps for v in group.videos
+                        if probe_by_path.get(v) and probe_by_path[v].fps > 0),
+                       0.0)
+
             # --- 1) 复制流合并 ---
+            # concat 输入加 -fflags +genpts 补全缺失 PTS (时间戳不干净的
+            # 源在 concat/编码链路上会被放大为时长虚增+冻结帧)。
             list_file = tmpdir / "concat.txt"
             entries = []
             for v in group.videos:
@@ -423,6 +516,10 @@ class VideoMerger:
 
             cmd = [
                 self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            ]
+            if vm.concat_genpts:
+                cmd += ["-fflags", "+genpts"]
+            cmd += [
                 "-f", "concat", "-safe", "0", "-i", str(list_file),
                 "-c", "copy", str(merged_tmp),
             ]
@@ -436,19 +533,20 @@ class VideoMerger:
                 return False
             say(f"  [green]✓[/] 复制流合并完成 → {merged_tmp.name}")
 
-            # --- 2) AV1 转码 ---
+            # --- 2) AV1 转码 (normalize_pts: setpts 重排, 消除 PTS 空洞) ---
             say("  转码 AV1 …")
-            cmd = self._build_transcode_cmd(merged_tmp, out_path, encoder, vm)
+            cmd = self._build_transcode_cmd(merged_tmp, out_path, encoder,
+                                            vm, fps)
             ok, err = self._run(cmd, vm.timeout)
             if not ok:
                 # 硬件编码失败 → 尝试 CPU 回退
                 fallback = "libaom-av1" if encoder == "libsvtav1" else "libsvtav1"
                 if fallback and fallback != encoder and self._has_encoder(fallback):
                     say(f"[yellow]⚠ {encoder} 转码失败，回退 {fallback}…[/]")
-                    cmd = self._build_transcode_cmd(merged_tmp, out_path, fallback, vm)
+                    encoder = fallback
+                    cmd = self._build_transcode_cmd(merged_tmp, out_path,
+                                                    encoder, vm, fps)
                     ok, err = self._run(cmd, vm.timeout)
-                    if ok:
-                        encoder = fallback
             if not ok:
                 say(f"[red]✗ 转码失败: {err[:200]}[/]")
                 out_path.unlink(missing_ok=True)
@@ -457,9 +555,42 @@ class VideoMerger:
                 )
                 return False
 
+            # --- 3) 时长校验: 成片 vs 源视频时长之和 ---
+            expected = group.duration_sum
+            actual = self.probe_duration(out_path) if vm.duration_check else 0.0
+            if vm.duration_check and expected > 0 and actual > 0:
+                report.duration_info.append((out_path, expected, actual))
+                tol = max(vm.duration_tolerance_min_s,
+                          expected * vm.duration_tolerance_pct / 100.0)
+                if abs(actual - expected) > tol:
+                    say(f"[yellow]⚠ 时长异常: 期望 {fmt_duration(expected)}"
+                        f" / 实际 {fmt_duration(actual)}（偏差 "
+                        f"{abs(actual - expected):.1f}s > 容差 {tol:.1f}s）[/]")
+                    repaired = False
+                    if vm.duration_repair:
+                        say("  尝试 setpts 重排时间戳修复…")
+                        repaired, actual = self._repair_timestamps(
+                            out_path, list_file, fps, encoder, vm,
+                            tmpdir, say, expected)
+                    if not repaired:
+                        say(f"[red]✗ {out_path.name} 时长异常未修复 "
+                            f"(期望 {fmt_duration(expected)} / 实际 "
+                            f"{fmt_duration(actual)}) — 请检查该文件[/]")
+                        report.duration_issues.append(
+                            (out_path, expected, actual))
+                        report.messages.append(
+                            f"{out_path.name} 时长异常: "
+                            f"{fmt_duration(actual)} / 期望 {fmt_duration(expected)}"
+                        )
+            elif vm.duration_check:
+                say(f"  时长校验: {fmt_duration(actual)} (期望 "
+                    f"{fmt_duration(expected)})")
+
             size_mb = out_path.stat().st_size / (1024 * 1024) if out_path.exists() else 0
+            warn = " ⚠时长异常" if any(o == out_path for o, _, _ in report.duration_issues) else ""
             say(f"  [bold green]✓ 完成 → {out_path.name} "
-                f"({group.width}x{group.height}, {size_mb:.1f} MB, {encoder})[/]")
+                f"({group.width}x{group.height}, {size_mb:.1f} MB, "
+                f"{encoder}{warn})[/]")
             _log.info(
                 "[视频合并] 组 %dx%d 完成 → %s (%.1fMB, %s)",
                 group.width, group.height, out_path.name, size_mb, encoder,
@@ -469,44 +600,114 @@ class VideoMerger:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _build_transcode_cmd(
-        self, src: Path, dst: Path, encoder: str, vm,
-    ) -> List[str]:
-        """构造 AV1 转码命令（关键帧/音频/字幕按配置）。"""
-        quality_arg = _QUALITY_ARG.get(encoder, "-crf")
+    def _repair_timestamps(
+        self,
+        out_path: Path,
+        list_file: Path,
+        fps: float,
+        encoder: str,
+        vm,
+        tmpdir: Path,
+        say: Callable[[str], None],
+        expected: float,
+    ) -> Tuple[bool, float]:
+        """时长异常修复: 跳过中间产物, 直接从 concat 列表重转码并用
+        setpts 重排视频时间戳 (消除 PTS 空洞/冻结段)。
+
+        修复成功且时长达标 → 替换 out_path, 返回 (True, 新时长);
+        否则保留原输出, 返回 (False, 原时长)。
+        """
+        repair_tmp = tmpdir / "repair.mp4"
         cmd = [
             self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(src),
+        ]
+        if vm.concat_genpts:
+            cmd += ["-fflags", "+genpts"]
+        cmd += [
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", self._setpts_filter(fps),
+        ]
+        cmd += self._encode_args(encoder, vm, fps)
+        cmd += ["-movflags", "+faststart", str(repair_tmp)]
+        ok, err = self._run(cmd, vm.timeout)
+        if not ok:
+            say(f"  [dim]修复转码失败: {err[:160]} — 保留原输出。[/]")
+            return False, self.probe_duration(out_path)
+        actual = self.probe_duration(repair_tmp)
+        tol = max(vm.duration_tolerance_min_s,
+                  expected * vm.duration_tolerance_pct / 100.0)
+        if actual <= 0 or abs(actual - expected) > tol:
+            say(f"  [dim]修复后时长仍异常 ({fmt_duration(actual)}), "
+                f"保留原输出。[/]")
+            return False, self.probe_duration(out_path)
+        try:
+            out_path.unlink(missing_ok=True)
+            shutil.move(str(repair_tmp), str(out_path))
+        except OSError as exc:
+            say(f"  [dim]修复文件替换失败: {exc} — 保留原输出。[/]")
+            return False, self.probe_duration(out_path)
+        say(f"  [green]✓ 修复成功: {fmt_duration(actual)} "
+            f"(期望 {fmt_duration(expected)})[/]")
+        return True, actual
+
+    @staticmethod
+    def _setpts_filter(fps: float) -> str:
+        """视频时间戳重排滤镜: 帧号重编 → 时长 = 帧数/fps。"""
+        if fps > 0:
+            return f"setpts=N/{fps:.5f}/TB"
+        return "setpts=N/FRAME_RATE/TB"      # 帧率未知时用输入元数据
+
+    def _encode_args(self, encoder: str, vm, fps: float) -> List[str]:
+        """编码器/音频公共参数 (转码与修复共用)。"""
+        quality_arg = _QUALITY_ARG.get(encoder, "-crf")
+        args = [
             "-c:v", encoder,
             quality_arg, str(vm.quality),
         ]
-        # 关键帧间隔（秒）→ 帧数: 探测合并后文件帧率
-        fps = self.probe(src).fps
+        # 关键帧间隔（秒）→ 帧数
         if fps <= 0:
             fps = 30.0
         g = max(1, round(fps * max(1, vm.keyframe_interval)))
-        cmd += ["-g", str(g), "-keyint_min", str(g)]
+        args += ["-g", str(g), "-keyint_min", str(g)]
 
         # av1_qsv: 参考 ShanaEncoder QSVAV1 预设 —— veryfast
         # (MFX_TARGETUSAGE_BEST_SPEED) 压缩效率低, 同质量下文件更大、
         # 细节保留更多; 不启用 look_ahead (ICQ 下会进一步压小体积,
         # 导致"体积过小、质量损失过多")。旧参数: -preset 0 -look_ahead 1
         if encoder == "av1_qsv":
-            cmd += ["-preset", vm.qsv_preset or "veryfast"]
+            args += ["-preset", vm.qsv_preset or "veryfast"]
             if getattr(vm, "qsv_profile", ""):
-                cmd += ["-profile:v", vm.qsv_profile]
+                args += ["-profile:v", vm.qsv_profile]
 
         # 音频: AAC LC 128k，声道保持原版
-        cmd += [
+        args += [
             "-c:a", vm.audio_codec,
             "-profile:a", vm.audio_profile,
             "-b:a", vm.audio_bitrate,
         ]
         if not vm.keep_channels:
-            cmd += ["-ac", "2"]
+            args += ["-ac", "2"]
         if vm.remove_subtitles:
-            cmd += ["-sn"]
+            args += ["-sn"]
+        return args
 
+    def _build_transcode_cmd(
+        self, src: Path, dst: Path, encoder: str, vm, fps: float = 0.0,
+    ) -> List[str]:
+        """构造 AV1 转码命令（关键帧/音频/字幕按配置）。
+
+        normalize_pts (默认开): -vf setpts=N/fps/TB 重排视频时间戳 —
+        concat 产物/QSV 编码器对 PTS 空洞/非单调时间戳会放大为成片
+        时长虚增+中段无法播放; 重排后成片时长 = 帧数/fps。
+        """
+        cmd = [
+            self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src),
+        ]
+        if getattr(vm, "normalize_pts", True):
+            cmd += ["-vf", self._setpts_filter(fps)]
+        cmd += self._encode_args(encoder, vm, fps)
         cmd += ["-movflags", "+faststart", str(dst)]
         return cmd
 

@@ -149,6 +149,32 @@ def main() -> int:
               == win2.src_model.rowCount(),
               f"src={win2.src_model.rowCount()}")
         check("连线画布已挂载", win2._flow.width() > 0)
+
+        # --- 3.5 流图展开交互 (默认收起/互斥展开/再点收起) --- #
+        flow = win2._flow
+        check("默认收起 (源链路隐藏)", flow._expanded_key is None)
+        tgts = list(win2.tgt_model.items)
+        flow.toggle_expand(tgts[0])
+        app.processEvents()
+        check("单击展开目标链路",
+              flow._expanded_key == (tgts[0].directory, tgts[0].name),
+              str(flow._expanded_key))
+        if len(tgts) > 1:
+            flow.toggle_expand(tgts[1])
+            app.processEvents()
+            check("互斥展开 (开新自动关旧)",
+                  flow._expanded_key == (tgts[1].directory, tgts[1].name),
+                  str(flow._expanded_key))
+            flow.toggle_expand(tgts[1])
+            app.processEvents()
+        check("再次单击收起", flow._expanded_key is None)
+        flow.toggle_expand(tgts[0])
+        app.processEvents()
+        pix = flow.grab()
+        check("流图展开态可渲染", not pix.isNull() and pix.width() > 0)
+        flow.collapse()
+        app.processEvents()
+
         win2.on_merge_only()
         ok = wait_until(lambda: not win2._busy, timeout=300, app=app)
         check("合并批次完成", ok)
@@ -159,6 +185,23 @@ def main() -> int:
         t1 = next((t for t in win2.tgt_model.items if t.name == "V1.mp4"), None)
         check("目标表已更新大小/节省率", bool(t1 and t1.output_size > 0
                                              and t1.orig_total > 0))
+
+        # --- 3.6 时长校验 (源视频各 1s; V1=单视频, V2=两视频) --- #
+        if v1.exists() and v2.exists():
+            from video_merge import VideoMerger
+            dur_m = VideoMerger(None, cfg2)
+            d1, d2 = dur_m.probe_duration(v1), dur_m.probe_duration(v2)
+            check("V1 时长 ≈ 1s", 0 < d1 <= 2.5, f"{d1:.2f}s")
+            check("V2 时长 ≈ 2s (时长无虚增)", 1.2 < d2 <= 3.5, f"{d2:.2f}s")
+            t2 = next((t for t in win2.tgt_model.items
+                       if t.name == "V2.mp4"), None)
+            check("V2 状态已合并 (无时长异常)",
+                  bool(t2 and t2.status == "已合并"),
+                  t2.status if t2 else "?")
+            check("时长校验数据已记录",
+                  bool(t2 and t2.duration_actual > 0
+                       and abs(t2.duration_actual - d2) < 0.5),
+                  f"actual={t2.duration_actual if t2 else '?'}")
     else:
         print("  [skip] 视频链路 (无 ffmpeg)")
 

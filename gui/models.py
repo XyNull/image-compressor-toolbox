@@ -9,6 +9,8 @@ from typing import List, Optional
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 
+from compressor import fmt_saving_pct, is_larger
+
 from .style import C_ERR, C_OK, C_RUN, C_WARN
 
 
@@ -60,6 +62,15 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} GB"
 
 
+def saving_color(output_size: int, original_size: int) -> str:
+    """体积变化列的文字色: 变小(节省)=绿, 变大=橙。
+
+    变大仍用绿色会与"节省"语义相悖（"越压越大则跳过"的行同样会展示数值）。
+    口径与 `compressor.fmt_saving_pct` 一致（变小 `-x%` / 变大 `+x%`）。
+    """
+    return C_WARN if is_larger(output_size, original_size) else C_OK
+
+
 class ImageQueueModel(QAbstractTableModel):
     """列: # / 文件名 / 格式 / 原始 / 压缩后 / 节省 / 状态。"""
 
@@ -98,10 +109,7 @@ class ImageQueueModel(QAbstractTableModel):
             if c == 4:
                 return _fmt_size(it.output_size) if it.output_size else "—"
             if c == 5:
-                if it.output_size and it.size:
-                    pct = (1 - it.output_size / it.size) * 100
-                    return f"-{pct:.0f}%"
-                return "—"
+                return fmt_saving_pct(it.output_size, it.size)
             if c == 6:
                 s = it.status.value
                 if it.status is ImgStatus.DONE and it.encoder:
@@ -115,7 +123,7 @@ class ImageQueueModel(QAbstractTableModel):
                 return s
         if role == Qt.ForegroundRole:
             if c == 5 and it.output_size and it.size:
-                return QColor(C_OK)
+                return QColor(saving_color(it.output_size, it.size))
             if c == 6:
                 col = STATUS_COLOR.get(it.status)
                 return QColor(col) if col else QColor(MUTED)
@@ -240,7 +248,7 @@ class VideoSourceModel(QAbstractTableModel):
             if c == 7:
                 color = {"待探测": MUTED, "待合并": None, "合并中": C_RUN,
                          "已合并": C_OK, "跳过": C_WARN, "失败": C_ERR,
-                         "已探测": MUTED}.get(it.status)
+                         "已探测": MUTED, "已合并产物": MUTED}.get(it.status)
                 return QColor(color) if color else None
         if role == Qt.ToolTipRole:
             return str(it.path)
@@ -315,15 +323,12 @@ class VideoTargetModel(QAbstractTableModel):
                 return _fmt_size(it.output_size) if it.output_size else "—"
             if c == 5:
                 # 节省率 = 1 - 目标大小 / 该组原始大小之和
-                if it.output_size and it.orig_total:
-                    pct = (1 - it.output_size / it.orig_total) * 100
-                    return f"-{pct:.0f}%"
-                return "—"
+                return fmt_saving_pct(it.output_size, it.orig_total)
             if c == 6:
                 return it.status
         if role == Qt.ForegroundRole:
             if c == 5 and it.output_size and it.orig_total:
-                return QColor(C_OK)
+                return QColor(saving_color(it.output_size, it.orig_total))
             if c == 6:
                 color = {"待合并": None, "合并中": C_RUN, "已合并": C_OK,
                          "跳过": C_WARN, "失败": C_ERR,

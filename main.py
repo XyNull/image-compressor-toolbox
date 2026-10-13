@@ -52,7 +52,9 @@ from textual.widgets import (
 )
 
 import config
-from compressor import CompressionResult, ImageCompressor
+from compressor import (
+    CompressionResult, ImageCompressor, fmt_saving_pct, is_larger,
+)
 from detector import SUPPORTED_FORMATS, detect_format
 from hwaccel import HardwareAccelerator
 from logger import get_logger, get_log_dir
@@ -755,12 +757,16 @@ class ImageCompressorApp(App):
 
         total_merged = 0
         total_skipped = 0
+        total_mixed = 0
+        total_done = 0
         all_outputs: List[Path] = []
         for d in dirs:
             self._safe_ui_log("")
             report = merger.merge_directory(d, log_cb=self._safe_ui_log)
             total_merged += report.merged
             total_skipped += report.skipped
+            total_mixed += getattr(report, "mixed_groups", 0)
+            total_done += getattr(report, "already_merged", 0)
             all_outputs.extend(report.outputs)
 
         # 末尾汇总提示（UI + 文件日志）
@@ -769,6 +775,10 @@ class ImageCompressorApp(App):
             self._safe_ui_log(
                 f"[bold green]═══ 视频合并完成: 成功 {total_merged} 组"
                 + (f"，跳过 {total_skipped} 组" if total_skipped else "")
+                + (f"（其中 {total_mixed} 组编码不一致已统一转码）"
+                   if total_mixed else "")
+                + (f"，{total_done} 个已合并产物未重复处理"
+                   if total_done else "")
                 + " ═══[/]"
             )
             self._safe_ui_log(
@@ -779,8 +789,10 @@ class ImageCompressorApp(App):
                 f"[yellow]═══ 视频合并结束: 未生成文件（跳过 {total_skipped} 组）═══[/]"
             )
         _log.info(
-            "视频合并结束 — 成功 %d 组, 跳过 %d 组, 输出 %s",
-            total_merged, total_skipped, [str(o) for o in all_outputs],
+            "视频合并结束 — 成功 %d 组, 跳过 %d 组, 混编统一 %d 组, "
+            "已有产物 %d 个, 输出 %s",
+            total_merged, total_skipped, total_mixed, total_done,
+            [str(o) for o in all_outputs],
         )
 
     def action_start_all(self) -> None:
@@ -1541,20 +1553,20 @@ class ImageCompressorApp(App):
         elif result.success:
             orig_mb = result.original_size / (1024 * 1024)
             out_mb = result.output_size / (1024 * 1024)
-            if result.original_size > 0:
-                ratio = (1 - result.output_size / result.original_size) * 100
-            else:
-                ratio = 0.0
+            # 体积变化口径与 GUI 表格一致: 变小 -x% (绿), 变大 +x% (红)
+            # (2026-09-23 统一; 旧写法 {ratio:+.0f}% 把"节省"显示成 "+92%")
+            delta = fmt_saving_pct(result.output_size, result.original_size)
+            color = ("red" if is_larger(result.output_size,
+                                        result.original_size) else "green")
 
             scale_str = (
                 f", 缩放{result.scale_count}次" if result.scale_count else ""
             )
-            color = "green" if ratio >= 0 else "red"
             log.write(
                 f"[green]✓[/] {name} → "
                 f"[cyan]{out_mb:.2f} MB[/] "
                 f"(原 {orig_mb:.2f} MB, {fmt_str}{scale_str}, "
-                f"[{color}]{ratio:+.0f}%[/])"
+                f"[{color}]{delta}[/])"
             )
         else:
             log.write(
@@ -1585,13 +1597,11 @@ class ImageCompressorApp(App):
                     name, fmt_str, orig_kb, out_kb,
                 )
         elif result.success:
-            ratio = (
-                (1 - result.output_size / result.original_size) * 100
-                if result.original_size > 0 else 0.0
-            )
             _log.info(
-                "成功 %s | %s | 原%.0fKB → %.0fKB (%+.0f%%) 缩放%d次",
-                name, fmt_str, orig_kb, out_kb, ratio, result.scale_count,
+                "成功 %s | %s | 原%.0fKB → %.0fKB (%s) 缩放%d次",
+                name, fmt_str, orig_kb, out_kb,
+                fmt_saving_pct(result.output_size, result.original_size),
+                result.scale_count,
             )
         else:
             _log.error("失败 %s | %s | %s", name, fmt_str, result.error)

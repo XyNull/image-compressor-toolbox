@@ -26,6 +26,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, \
     QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
+from compressor import fmt_saving_pct, is_larger
 from .models import VideoItem, TargetItem, _fmt_size
 from .style import C_ERR, C_OK, C_RUN, C_WARN
 from video_merge import fmt_duration
@@ -53,7 +54,7 @@ _STATUS_COLOR = {
 
 
 def _grayish(status: str) -> bool:
-    return status in ("待探测", "已探测", "组数超限", "单组超限")
+    return status in ("待探测", "已探测", "组数超限", "单组超限", "已合并产物")
 
 
 def _color_of(status: str) -> QColor:
@@ -148,6 +149,24 @@ class MergeFlowView(QWidget):
         if self._expanded_key is not None:
             self._expanded_key = None
             self._relayout()
+
+    def auto_follow(self, directory, name: str) -> None:
+        """合并进行中自动跟随 (修复: 连线仅在展开的链路上绘制, 合并开始后
+        若无展开则流动动画不可见)。
+
+        规则: 当前无展开、或展开的目标不在"合并中"状态时, 切换展开该任务
+        的链路; 用户正盯着某个"合并中"链路时不抢焦点 (点击目标可"钉住")。
+        """
+        exp = self._expanded()
+        if exp is not None and exp[0].status == "合并中":
+            return
+        for t in self._tgt():
+            if t.directory == directory and t.name == name:
+                key = (t.directory, t.name)
+                if self._expanded_key != key:
+                    self._expanded_key = key
+                    self.refresh()          # 含动画计时器启停 + 重绘
+                return
 
     def _relayout(self) -> None:
         self._update_min_height()
@@ -404,14 +423,17 @@ class MergeFlowView(QWidget):
                     f"目标: {it.target or '—'} · 状态: {it.status}<br>"
                     f"<span style='color:#9a9b9f'>{it.path}</span>")
         it = self._tgt()[idx]
+        label = "节省率"
         saving = "—"
         if it.output_size and it.orig_total:
-            saving = f"-{(1 - it.output_size / it.orig_total) * 100:.0f}%"
+            saving = fmt_saving_pct(it.output_size, it.orig_total)
+            if is_larger(it.output_size, it.orig_total):   # 变大改口径
+                label = "体积变化"
         html = (f"<b>{it.name}</b> · {it.directory.name}<br>"
                 f"视频数: {it.video_count} · 原始合计: "
                 f"{_fmt_size(it.orig_total)}<br>"
                 f"目标大小: {_fmt_size(it.output_size) if it.output_size else '—'}"
-                f" · 节省率: {saving}<br>")
+                f" · {label}: {saving}<br>")
         if it.duration_actual > 0:
             html += (f"时长: {fmt_duration(it.duration_actual)}"
                      f" (源合计 {fmt_duration(it.duration_expected)})<br>")

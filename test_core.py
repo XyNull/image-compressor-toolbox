@@ -17,7 +17,7 @@ from PIL import Image
 # Ensure local modules are importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from compressor import ImageCompressor
+from compressor import ImageCompressor, fmt_saving_pct
 from detector import detect_format, SUPPORTED_FORMATS
 from hwaccel import HardwareAccelerator
 import config
@@ -162,11 +162,11 @@ def main():
         elif result.success and result.is_video:
             orig_mb = result.original_size / (1024 * 1024)
             out_mb = result.output_size / (1024 * 1024)
-            ratio = (1 - result.output_size / result.original_size) * 100 if result.original_size else 0
+            delta = fmt_saving_pct(result.output_size, result.original_size)
             enc = result.encoder or "?"
             print(
                 f"  🎬 {name:15s} → {out_mb:.2f} MB "
-                f"(was {orig_mb:.2f} MB, {result.fmt.upper()}→MP4 [{enc}], {ratio:+.0f}%)"
+                f"(was {orig_mb:.2f} MB, {result.fmt.upper()}→MP4 [{enc}], {delta})"
             )
             if result.output_path and result.output_path.exists():
                 print(f"      output: {result.output_path}")
@@ -176,13 +176,13 @@ def main():
         elif result.success:
             orig_mb = result.original_size / (1024 * 1024)
             out_mb = result.output_size / (1024 * 1024)
-            ratio = (1 - result.output_size / result.original_size) * 100 if result.original_size else 0
+            delta = fmt_saving_pct(result.output_size, result.original_size)
             ok_size = result.output_size <= TARGET_BYTES
             status = "✓" if ok_size else "⚠"
             print(
                 f"  {status} {name:15s} → "
                 f"{out_mb:.2f} MB (was {orig_mb:.2f} MB, "
-                f"{result.scale_count}× scale, {ratio:+.0f}%)"
+                f"{result.scale_count}× scale, {delta})"
             )
             # Verify output file exists
             if result.output_path and result.output_path.exists():

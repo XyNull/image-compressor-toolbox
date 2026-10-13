@@ -56,6 +56,31 @@ class CompressionResult:
     encoder: Optional[str] = None      # FFmpeg 编码器 (hevc_nvenc / libx265 等)
 
 
+# --- 体积变化文本 (GUI / TUI 共用口径, 放 core 以杜绝两套界面各写一份) ------- #
+
+def fmt_saving_pct(output_size: int, original_size: int) -> str:
+    """体积变化率文本 — **全项目统一口径**: 变小(节省) ``-5%`` / 变大 ``+5%``。
+
+    为什么放在 core (2026-09-23): GUI 表格、合并流图浮窗与 TUI 运行日志都要显示
+    这个百分比, 三处各写一份符号逻辑 → 漂移出两种相反约定 —— GUI 写死
+    ``f"-{pct:.0f}%"`` 在"压后更大"时输出双负号 ``--5%``; TUI 用 ``{ratio:+.0f}%``
+    则把节省显示成 ``+92%``。现统一为本函数口径, 变小为负、变大为正。
+
+    绝对值不足 0.5% 显示 ``0%`` (避免 ``-0%`` / ``+0%``); 缺值显示 ``—``。
+    """
+    if not output_size or not original_size:
+        return "—"
+    pct = (1 - output_size / original_size) * 100
+    if abs(pct) < 0.5:
+        return "0%"
+    return f"-{pct:.0f}%" if pct > 0 else f"+{-pct:.0f}%"
+
+
+def is_larger(output_size: int, original_size: int) -> bool:
+    """体积是否变大 (GUI 用它决定"警告色 vs 节省色"与浮窗标签口径)。"""
+    return bool(original_size) and output_size > original_size
+
+
 # --- Compressor ------------------------------------------------------------ #
 
 class ImageCompressor:

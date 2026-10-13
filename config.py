@@ -64,13 +64,16 @@ DEFAULTS: dict[str, Any] = {
         "audio_bitrate": "128k",
         "keep_channels": True,         # 声道数保持与原版一致
         "remove_subtitles": True,      # 移除字幕
-        "tolerance_px": 2,             # 分辨率容差 (1918x1080 ≈ 1920x1080)
-        "max_videos_per_group": 10,    # 单组视频数超过此值不合并
-        "max_output_files": 4,         # 分辨率组数(目标文件数)超过此值不合并
+        "tolerance_px": 100,           # 分辨率容差 (1918x1080 ≈ 1920x1080)
+        "max_videos_per_group": 100,   # 单组视频数超过此值不合并
+        "max_output_files": 10,        # 分辨率组数(目标文件数)超过此值不合并
         "output_prefix": "V",          # 输出文件名前缀 → V1.mp4, V2.mp4
         "output_extension": "mp4",
         "overwrite_existing": False,   # 目标文件已存在时是否覆盖 (False=跳过)
+        "mixed_codec_merge": True,     # 组内编码不一致: True=统一规格转码后合并, False=跳过
         "timeout": 3600,               # 单次合并+转码超时 (秒)
+        "concat_workers": 10,          # 阶段1 复制流合并并发数 (同时拼接的组数)
+        "transcode_workers": 2,        # 阶段2 AV1 转码并发数 (QSV 硬编建议 1-2)
         "concat_genpts": True,         # concat 输入加 -fflags +genpts (补全缺失 PTS)
         "normalize_pts": True,         # 转码前 setpts 重排视频时间戳 (修复时长虚增/冻结帧)
         "duration_check": True,        # 合并后校验成片时长 vs 源视频时长之和
@@ -136,13 +139,18 @@ audio_profile = "aac_low"    # 音频规格 (aac_low = AAC LC)
 audio_bitrate = "128k"       # 音频码率
 keep_channels = true         # true=声道数保持与原版一致, false=强制 2 声道
 remove_subtitles = true      # true=移除字幕
-tolerance_px = 2             # 分辨率容差: 宽高差 ≤ 此值视为相同分辨率 (1918x1080 ≈ 1920x1080)
-max_videos_per_group = 10    # 同一分辨率组视频数超过此值时不合并
-max_output_files = 4         # 目录内分辨率组数(即目标文件数)超过此值时不合并
+tolerance_px = 100           # 分辨率容差: 宽高差 ≤ 此值视为相同分辨率 (1918x1080 ≈ 1920x1080)
+max_videos_per_group = 100   # 同一分辨率组视频数超过此值时不合并
+max_output_files = 10        # 目录内分辨率组数(即目标文件数)超过此值时不合并
 output_prefix = "V"          # 输出文件名前缀 → V1.mp4, V2.mp4
 output_extension = "mp4"
 overwrite_existing = false   # 目标文件已存在时: true=覆盖, false=跳过该组
+mixed_codec_merge = true     # 组内视频编码不一致时: true=逐源统一规格后拼接转 AV1
+                             # (推荐, 只编码一次), false=跳过该组
+                             # 复制流拼接失败(同编码但参数不一致)也会退回这条路径
 timeout = 3600               # 单次合并+转码超时（秒）
+concat_workers = 10          # 视频合并并发数（阶段1 复制流拼接, 同时进行的组数）
+transcode_workers = 2        # 转AV1并发数（阶段2 转码, QSV 硬编建议 1-2）
 concat_genpts = true         # concat 输入加 -fflags +genpts (补全缺失 PTS)
 normalize_pts = true         # 转码前 setpts=N/fps/TB 重排视频时间戳:
                              # concat 产物/QSV 编码器对 PTS 空洞会放大为
@@ -222,13 +230,16 @@ class VideoMergeConfig:
     audio_bitrate: str = "128k"
     keep_channels: bool = True
     remove_subtitles: bool = True
-    tolerance_px: int = 2
-    max_videos_per_group: int = 10
-    max_output_files: int = 4
+    tolerance_px: int = 100
+    max_videos_per_group: int = 100
+    max_output_files: int = 10
     output_prefix: str = "V"
     output_extension: str = "mp4"
     overwrite_existing: bool = False
+    mixed_codec_merge: bool = True
     timeout: int = 3600
+    concat_workers: int = 10
+    transcode_workers: int = 2
     concat_genpts: bool = True
     normalize_pts: bool = True
     duration_check: bool = True

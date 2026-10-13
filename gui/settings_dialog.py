@@ -380,8 +380,20 @@ class SettingsDialog(QDialog):
         self._add_bool(form, "video_merge", "overwrite_existing",
                        "目标已存在时覆盖",
                        tip="否则跳过该组")
+        self._add_bool(form, "video_merge", "mixed_codec_merge",
+                       "编码不一致时统一转码合并",
+                       tip="组内视频编码不同 (如 h264+hevc) 时: 逐源统一分辨率/"
+                           "帧率后拼接并转 AV1 (只编码一次), 而不是跳过该组; "
+                           "复制流拼接失败的组也退回这条路径")
         self._add_unit_spin(form, "video_merge", "timeout", "合并超时",
                             {"秒": 1, "分钟": 60}, "分钟", 1, 1440)
+        self._add_spin(form, "video_merge", "concat_workers",
+                       "视频合并并发数", 1, 32,
+                       tip="阶段1 复制流拼接同时进行的组数 (默认 10)")
+        self._add_spin(form, "video_merge", "transcode_workers",
+                       "转AV1并发数", 1, 8,
+                       tip="阶段2 AV1 转码同时进行的组数; "
+                           "QSV 硬编建议 1-2 (默认 2)")
         form.addRow(self._hr(w))
         self._add_bool(form, "video_merge", "concat_genpts",
                        "genpts 补全时间戳",

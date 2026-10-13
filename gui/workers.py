@@ -22,6 +22,48 @@ from .overwrite import detect_leftover, execute_overwrite
 
 
 # --------------------------------------------------------------------- #
+#  线程释放 (全项目统一入口)
+# --------------------------------------------------------------------- #
+
+# 丢引用前等待线程真正结束的上限 (ms)。终局信号都是 run() 末尾 emit 的,
+# 排队到主线程时线程通常只差几条收尾指令, 实测 wait 立即返回。
+_THREAD_JOIN_MS = 3000
+
+
+def release_thread(th: Optional[QThread]) -> Optional[QThread]:
+    """安全丢弃 QThread 引用: 先确认线程真的结束了, 否则继续持有。
+
+    ⚠️ 为什么必须这样 (2026-09-25 崩溃修复, 有实测复现):
+    PySide6 中 QThread 的**最后一份 Python 引用**被丢掉时会立即 `delete` C++ 对象。
+    而本项目各线程的终局信号 (`done` / `finished_all` / `found`) 都是在 `run()`
+    末尾 `emit` 的 —— 信号排队到主线程执行时, 工作线程往往还差几条指令才真正退出
+    (`isRunning()` 实测仍为 True, 因为 QThread 只在私有 `finish()` 里才把
+    running 置 false 并补发 `finished`)。此刻析构 = Qt 明令禁止的
+    "destroyed while thread is still running": 工作线程继续写已释放内存 →
+    **进程硬崩, 没有任何 Python traceback**, 只在 `logs/gui_console.log` 留一句
+    `QThread: Destroyed while thread '' is still running`。
+    实测: 丢引用那一刻进程即死 (`exit=127`, 连 print 都来不及输出)。
+
+    用法: `self._x_thread = release_thread(self._x_thread)`
+      - 返回 None  → 线程已结束, 引用可以安全丢弃 (析构安全)
+      - 返回原对象 → 线程仍在运行, 调用方**继续持有**(宁可多留一个线程对象,
+        也绝不析构运行中的线程; 下个批次替换引用时它早已结束)
+
+    等待不会死锁: 本项目信号一律非阻塞队列投递, 工作线程不会反向阻塞主线程。
+    """
+    if th is None:
+        return None
+    try:
+        running = th.isRunning()
+    except RuntimeError:
+        # C++ 对象已被 deleteLater 回收 (包装器失效) → 已无需持有
+        return None
+    if running and not th.wait(_THREAD_JOIN_MS):
+        return th
+    return None
+
+
+# --------------------------------------------------------------------- #
 #  扫描线程
 # --------------------------------------------------------------------- #
 
@@ -119,7 +161,7 @@ class ScanThread(QThread):
                 detected = list(pool.map(_detect_one, candidates))
 
         # Phase 3: 分类入列
-        # 视频收集与 VideoMerger._scan_videos 对齐: 只收 merge_dirs 顶层视频
+        # 视频收集与 VideoMerger.scan_videos 对齐: 只收 merge_dirs 顶层视频
         merge_dir_set = set(merge_dirs)
         video_seen: set = set()
         for p, size, fmt in detected:
@@ -146,6 +188,50 @@ class ScanThread(QThread):
 
         leftover = detect_leftover(self.paths, self.leftover_seen)
         self.done.emit(images, videos, merge_dirs, leftover, skipped_non_image)
+
+
+# --------------------------------------------------------------------- #
+#  合并前视频复查线程
+# --------------------------------------------------------------------- #
+
+class VideoRefreshThread(QThread):
+    """合并前复查合并目录: 找出"盘子上的视频"里列表还没有的那些。
+
+    为什么需要 (2026-09-23 修复): 压缩阶段会把多帧动图转成 MP4, 覆盖模式下
+    立即移回所在目录 —— 这些 MP4 在拖入扫描时并不存在, 所以不在 src_model 里;
+    而合并阶段 (VideoMerger.plan_directory) 是**合并前重新扫描磁盘**的, 会把
+    它们一并合并。结果就是"文件确实被合并了, 但流图里看不到、分组预览也偏小"。
+
+    这里用与合并器完全相同的扫描规则 (VideoMerger.scan_videos) 复查一遍,
+    只扫合并目录顶层 (与合并范围一致), 不递归、不重扫整棵目录树, 因此开销
+    与目录数成正比、与目录体积无关。
+
+    用户右键"移除选中"过的路径 (exclude) 保持排除, 不会被复查加回。
+    """
+
+    found = Signal(list)   # List[VideoItem] 列表里缺失的视频
+
+    def __init__(self, dirs: List[Path], known: set,
+                 exclude: Optional[set] = None) -> None:
+        super().__init__()
+        self.dirs = list(dirs)
+        self.known = set(known)
+        self.exclude = set(exclude or ())
+
+    def run(self) -> None:
+        seen = set(self.known)
+        new_items: List[VideoItem] = []
+        for d in self.dirs:
+            for p in VideoMerger.scan_videos(Path(d)):
+                if p in seen or p in self.exclude:
+                    continue
+                seen.add(p)
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0            # 体积仅用于统计, 拿不到不阻断
+                new_items.append(VideoItem(path=p, size=size))
+        self.found.emit(new_items)
 
 
 # --------------------------------------------------------------------- #
@@ -284,10 +370,13 @@ class CompressThread(QThread):
 # --------------------------------------------------------------------- #
 
 class MergeThread(QThread):
-    """视频合并转码 — 对每个候选目录串行调用 VideoMerger.merge_directory。"""
+    """视频合并转码 — 批量规划所有目录后走全局两级并发流水线
+    (阶段1 复制流合并 concat_workers 并发 → 阶段2 AV1 转码
+    transcode_workers 并发, 跨目录混排)。"""
 
     log = Signal(str, str)
-    dir_started = Signal(str)               # 目录路径
+    dir_started = Signal(str)               # 目录路径 (规划完成, 进入待合并)
+    task_started = Signal(str, str)         # (目录, 输出文件名) 子任务开跑
     dir_done = Signal(object)               # MergeReport
     finished_all = Signal(bool)
 
@@ -321,8 +410,12 @@ class MergeThread(QThread):
         if not dirs:
             return
         vm_cfg = self.cfg.video_merge
-        self.log.emit(f"开始视频合并转码 — {len(dirs)} 个目录…", "ok")
-        _log.info("GUI 视频合并开始 — 目录 %d 个", len(dirs))
+        cw = max(1, int(getattr(vm_cfg, "concat_workers", 1) or 1))
+        tw = max(1, int(getattr(vm_cfg, "transcode_workers", 1) or 1))
+        self.log.emit(f"开始视频合并转码 — {len(dirs)} 个目录"
+                      f"（合并并发 {cw} / 转码并发 {tw}）…", "ok")
+        _log.info("GUI 视频合并开始 — 目录 %d 个 (concat=%d, transcode=%d)",
+                  len(dirs), cw, tw)
 
         merger = VideoMerger(None, self.cfg)
         if not merger.is_available():
@@ -332,27 +425,54 @@ class MergeThread(QThread):
                       f"| 关键帧 {vm_cfg.keyframe_interval}s | 音频 "
                       f"{vm_cfg.audio_codec} {vm_cfg.audio_bitrate}", "info")
 
-        total_merged = 0
-        total_skipped = 0
-        all_outputs: List[Path] = []
+        # 阶段 A: 逐目录规划 (串行: 扫描/探测/分组/限制)
+        plans: List[tuple] = []
         for d in dirs:
             if self.cancel.is_set():
-                self.log.emit("已停止 — 剩余目录未合并", "warn")
+                self.log.emit("已停止 — 剩余目录未规划", "warn")
                 break
             self.dir_started.emit(str(d))
-            report = merger.merge_directory(
-                d, log_cb=lambda t, lv="info": self.log.emit(t, lv),
+            report, tasks = merger.plan_directory(
+                d, log_cb=lambda t: self.log.emit(t),
                 exclude=self.exclude)
+            plans.append((report, tasks))
+
+        # 阶段 B: 全局两级并发流水线 (concat 池 → 转码池)
+        def on_start(task, phase: str) -> None:
+            self.task_started.emit(str(task.directory),
+                                   task.out_path.name)
+
+        def say(t: str, lv: str = "info") -> None:
+            self.log.emit(t, lv)
+
+        merger.run_pipeline(plans, vm_cfg, say=say,
+                            cancelled=self.cancel, on_start=on_start)
+
+        # 阶段 C: 汇总 + 逐目录报告
+        total_merged = 0
+        total_skipped = 0
+        total_mixed = 0
+        total_done = 0
+        all_outputs: List[Path] = []
+        for report, tasks in plans:
+            merger.finalize_report(report, tasks)
             total_merged += report.merged
             total_skipped += report.skipped
+            total_mixed += getattr(report, "mixed_groups", 0)
+            total_done += getattr(report, "already_merged", 0)
             all_outputs.extend(report.outputs)
             self.dir_done.emit(report)
 
         self.log.emit(f"视频合并结束: 成功 {total_merged} 组, 跳过 {total_skipped} 组"
+                      + (f"（其中 {total_mixed} 组编码不一致已统一转码）"
+                         if total_mixed else "")
+                      + (f"，{total_done} 个已合并产物未重复处理"
+                         if total_done else "")
                       + (f"，输出 {len(all_outputs)} 个文件" if all_outputs else ""),
                       "ok" if total_merged else "warn")
-        _log.info("GUI 视频合并结束 — 成功 %d, 跳过 %d, 输出 %s",
-                  total_merged, total_skipped, [str(o) for o in all_outputs])
+        _log.info("GUI 视频合并结束 — 成功 %d, 跳过 %d, 混编统一 %d, 已有产物 %d, "
+                  "输出 %s", total_merged, total_skipped, total_mixed,
+                  total_done, [str(o) for o in all_outputs])
 
 
 # --------------------------------------------------------------------- #

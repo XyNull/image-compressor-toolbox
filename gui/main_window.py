@@ -33,6 +33,7 @@ from .settings_dialog import SettingsDialog
 from .style import qss_for
 from .workers import (
     CompressThread, MergeThread, ProbeThread, RedoThread, ScanThread,
+    VideoRefreshThread, release_thread,
 )
 
 STATE_FILE = Path(__file__).resolve().parent.parent / "gui_state.json"
@@ -87,9 +88,11 @@ class MainWindow(QMainWindow):
         self._compress_thread: Optional[CompressThread] = None
         self._scan_thread: Optional[ScanThread] = None
         self._probe_thread: Optional[ProbeThread] = None
+        self._refresh_thread: Optional[VideoRefreshThread] = None
         self._merge_thread: Optional[MergeThread] = None
         self._redo_thread: Optional[RedoThread] = None
         self._merge_after_compress = True   # 压缩后是否继续合并 (一键开始)
+        self._probe_then_merge = False      # 合并前复查探测完成后继续合并
 
         self._build_ui()
         self._apply_theme(self._load_theme())
@@ -422,7 +425,7 @@ class MainWindow(QMainWindow):
     def _on_scan_done(self, images: List[QueueItem], videos: List[VideoItem],
                       merge_dirs: list, leftover: list,
                       skipped: int) -> None:
-        self._scan_thread = None
+        self._scan_thread = release_thread(self._scan_thread)
         # 图片
         existing = {it.path for it in self.img_model.items}
         new_items = [it for it in images if it.path not in existing]
@@ -490,8 +493,11 @@ class MainWindow(QMainWindow):
         self.src_model.update_row(row)
 
     def _on_probe_all_done(self) -> None:
-        self._probe_thread = None
+        self._probe_thread = release_thread(self._probe_thread)
         self.regroup()
+        if self._probe_then_merge:      # 合并前的复查探测: 探完继续走合并
+            self._probe_then_merge = False
+            self._launch_merge()
 
     def regroup(self) -> None:
         """按目录对已探测视频分组 → 生成 V1/V2 目标预览 (与合并器一致)。"""
@@ -503,11 +509,28 @@ class MainWindow(QMainWindow):
                 by_dir.setdefault(v.path.parent, []).append(v)
         targets: List[TargetItem] = []
         links: List[Tuple[List[int], int]] = []
+        done_count = 0
         for d in sorted(by_dir):
             items = by_dir[d]
             probes = [VideoProbe(path=v.path, width=v.width, height=v.height,
                                  vcodec=v.vcodec, ok=True) for v in items]
             groups = merger._group_videos(probes)
+            # 前期合并产物 (已是 AV1 的 V*.mp4 且本目录同分辨率仅此一份) 不参与
+            # 合并 —— 与合并器同一判据, 保证流图显示 = 实际合并范围。
+            probe_map = {p.path: p for p in probes}
+            done_paths = set(merger.detect_merged_outputs(groups, probe_map, vm))
+            if done_paths:
+                for v in items:
+                    if v.path in done_paths:
+                        v.target = ""
+                        v.status = "已合并产物"
+                        r = self.src_model.find_row(v.path)
+                        if r >= 0:
+                            self.src_model.update_row(r)
+                done_count += len(done_paths)
+                for g in groups:
+                    g.videos = [p for p in g.videos if p not in done_paths]
+                groups = [g for g in groups if g.videos]
             over_groups = len(groups) > vm.max_output_files
             out_index = 0
             for g in groups:
@@ -549,6 +572,9 @@ class MainWindow(QMainWindow):
         self.tgt_model.reset_items(targets)
         self.src_model.refresh_all()
         self._video_links = links
+        if done_count:
+            self._log(f"跳过 {done_count} 个前期合并产物"
+                      "（已是 AV1 成品，且本目录同分辨率无可合并对象）")
         self._flow.refresh()
 
     # ------------------------------------------------------------------ #
@@ -674,7 +700,7 @@ class MainWindow(QMainWindow):
         self._update_stats()
 
     def _on_compress_done(self, ok: bool) -> None:
-        self._compress_thread = None
+        self._compress_thread = release_thread(self._compress_thread)
         if not ok:
             self._finish_batch()
             return
@@ -686,17 +712,58 @@ class MainWindow(QMainWindow):
             self._finish_batch()
 
     def _start_merge(self) -> None:
+        """进入合并阶段: 先复查视频列表, 再启动合并线程。
+
+        复查的必要性 (2026-09-23 修复): src_model 是"拖入时扫描"的快照, 而压缩
+        阶段新产生的动图转码 MP4 (覆盖模式下已移回所在目录) 不在其中; 合并线程
+        却是合并前重新扫描磁盘的, 于是出现"实际合并了但流图里没有"。先复查补齐
+        (含探测→重新分组) 可保证流图显示 = 实际合并范围。
+        """
         self.prog_label.setText("视频合并中…")
         self.progress.setRange(0, 0)  # 忙碌指示
+        self._refresh_thread = VideoRefreshThread(
+            list(self._merge_dirs),
+            known={v.path for v in self.src_model.items},
+            exclude=self._merge_excluded)
+        self._refresh_thread.found.connect(self._on_videos_refreshed)
+        self._refresh_thread.finished.connect(self._refresh_thread.deleteLater)
+        self._refresh_thread.start()
+
+    def _on_videos_refreshed(self, new_videos: List[VideoItem]) -> None:
+        """复查结果: 有新增先探测再合并 (让分组用真实分辨率), 否则直接合并。"""
+        self._refresh_thread = release_thread(self._refresh_thread)
+        if not new_videos:
+            self._launch_merge()
+            return
+        self.src_model.reset_items(self.src_model.items + new_videos)
+        names = "、".join(v.path.name for v in new_videos[:3])
+        more = f" 等 {len(new_videos)} 个" if len(new_videos) > 3 else ""
+        self._log(f"合并前复查: 新增 {len(new_videos)} 个视频（{names}{more}）"
+                  "— 多为压缩阶段动图转成的 MP4, 已加入合并列表", "ok")
+        self._flow.refresh()               # 先显示"待探测"节点
+        self._update_stats()
+        self._probe_then_merge = True
+        self._start_probe(new_videos)
+
+    def _launch_merge(self) -> None:
         self._merge_thread = MergeThread(list(self._merge_dirs), self.cfg,
                                          self._cancel,
                                          exclude=self._merge_excluded)
         self._merge_thread.log.connect(self._log)
         self._merge_thread.dir_started.connect(self._on_merge_dir_started)
+        self._merge_thread.task_started.connect(self._on_merge_task_started)
         self._merge_thread.dir_done.connect(self._on_merge_dir_done)
         self._merge_thread.finished_all.connect(self._on_merge_done)
         self._merge_thread.finished.connect(self._merge_thread.deleteLater)
         self._merge_thread.start()
+
+    def _on_merge_task_started(self, directory: str, name: str) -> None:
+        """子任务 (复制流合并/转码) 开跑 → 流图自动跟随展开其来源链路,
+        保证流动动画可见; 用户正盯着某个"合并中"链路时不抢焦点。"""
+        try:
+            self._flow.auto_follow(Path(directory), name)
+        except Exception:
+            pass
 
     def _on_merge_dir_started(self, d: str) -> None:
         dp = Path(d)
@@ -752,7 +819,7 @@ class MainWindow(QMainWindow):
         self._update_stats()
 
     def _on_merge_done(self, ok: bool) -> None:
-        self._merge_thread = None
+        self._merge_thread = release_thread(self._merge_thread)
         self._finish_batch()
 
     def _finish_batch(self) -> None:
@@ -793,7 +860,7 @@ class MainWindow(QMainWindow):
         self._redo_thread.start()
 
     def _on_redo_done(self, stats: dict) -> None:
-        self._redo_thread = None
+        self._redo_thread = release_thread(self._redo_thread)
         self._leftover = []
         self._leftover_seen = set()
         self.btn_redo.setEnabled(False)
@@ -998,4 +1065,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._cancel.set()
+        # 退出前给后台线程一点收尾时间: 解释器退出时销毁"仍在运行"的 QThread
+        # 会命中 Qt 禁止的 UB (见 workers.release_thread 的崩溃说明)。
+        for th in (self._scan_thread, self._probe_thread, self._refresh_thread,
+                   self._compress_thread, self._merge_thread,
+                   self._redo_thread):
+            if th is not None and th.isRunning():
+                th.wait(1500)
         event.accept()

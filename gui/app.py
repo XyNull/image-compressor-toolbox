@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import faulthandler
 import os
 import sys
 import traceback
@@ -17,6 +18,20 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# C 级崩溃 (访问违例 / abort) 的栈 → logs/faulthandler.log。
+# 为什么需要 (2026-09-25 教训): 诸如"析构仍在运行的 QThread"这类未定义行为会让
+# 进程**不带任何 Python traceback** 直接消失 -- 当时只留下 gui_console.log 里一句
+# Qt 警告, 定位全靠复现。faulthandler 至少留下崩溃瞬间各线程的 Python 栈。
+# 模块级持有文件对象, 防止被 GC 关闭。与 TUI (main.py) 写同一个文件, 便于对照。
+_fault_file = None
+try:
+    (_ROOT / "logs").mkdir(exist_ok=True)
+    _fault_file = open(_ROOT / "logs" / "faulthandler.log", "a",
+                       buffering=1)          # 行缓冲: 崩溃时尽量不丢
+    faulthandler.enable(_fault_file, all_threads=True)
+except Exception:                            # 兜底逻辑本身不得影响启动
+    _fault_file = None
 
 
 def _install_headless_guard() -> None:
